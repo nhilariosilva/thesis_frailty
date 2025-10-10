@@ -1,0 +1,8 @@
+# Pycache directory
+__pycache__/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+venv/
+env/
