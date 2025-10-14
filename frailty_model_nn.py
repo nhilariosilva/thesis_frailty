@@ -1,10 +1,13 @@
 
+import os
 import numpy as np
+
+
 
 import tensorflow as tf
 from tensorflow import keras
 import tensorflow_probability as tfp
-from keras import optimizers
+from keras import optimizers, initializers
 
 from tqdm.keras import TqdmCallback
 
@@ -83,12 +86,16 @@ class FrailtyModelNN(keras.models.Model):
             )
 
         # Include variables that are not trained by tensorflow (known, fixed constants or manual trained variables)
-        for parameter in np.concatenate([self.fixed_pars, self.manual_pars]):
+        for parameter in np.concatenate([self.fixed_pars, self.manual_pars]):            
             par = self.parameters[parameter]
-            self.model_variables[parameter] = self.add_weight(
-                name = parameter,
+
+            raw_parameter = "raw_" + parameter
+            raw_init = par["link_inv"]( par["init"] )
+            
+            self.model_variables[raw_parameter] = self.add_weight(
+                name = raw_parameter,
                 shape = par["shape"],
-                initializer = keras.initializers.Constant( par["initializer"] ),
+                initializer = keras.initializers.Constant( raw_init ),
                 trainable = False,
                 dtype = tf.float32
             )
@@ -207,17 +214,19 @@ class FrailtyModelNN(keras.models.Model):
 
     def apply_accumulated_gradients(self):
         # ----------------------------------- Independent parameters component -----------------------------------
-        # Apply the accumulated gradients to the trainable variables
-        self.optimizer_independent_pars.apply_gradients( zip(self.gradient_accumulation_independent_pars, self.trainable_variables[ :len(self.independent_pars) ]) )
-        # Resets all the cumulated gradients to zero
-        for i in range(len(self.gradient_accumulation_nn)):
-            self.gradient_accumulation_independent_pars[i].assign(tf.zeros_like(self.trainable_variables[ :len(self.independent_pars) ][i], dtype = tf.float32))
-        
+        if( len(self.independent_pars) > 0 ):
+            # Apply the accumulated gradients to the trainable variables
+            self.optimizer_independent_pars.apply_gradients( zip(self.gradient_accumulation_independent_pars, self.trainable_variables[ :len(self.independent_pars) ]) )
+            # Resets all the cumulated gradients to zero
+            for i in range(len(self.gradient_accumulation_independent_pars)):
+                self.gradient_accumulation_independent_pars[i].assign(tf.zeros_like(self.trainable_variables[ :len(self.independent_pars) ][i], dtype = tf.float32))
+
         # ----------------------------------- Neural network component -----------------------------------
-        self.optimizer_nn.apply_gradients( zip(self.gradient_accumulation_nn, self.trainable_variables[ len(self.independent_pars): ]) )
-        # Resets all the cumulated gradients to zero
-        for i in range(len(self.gradient_accumulation_nn)):
-            self.gradient_accumulation_nn[i].assign(tf.zeros_like(self.trainable_variables[ len(self.independent_pars): ][i], dtype = tf.float32))
+        if( len(self.nn_pars) > 0 ):
+            self.optimizer_nn.apply_gradients( zip(self.gradient_accumulation_nn, self.trainable_variables[ len(self.independent_pars): ]) )
+            # Resets all the cumulated gradients to zero
+            for i in range(len(self.gradient_accumulation_nn)):
+                self.gradient_accumulation_nn[i].assign(tf.zeros_like(self.trainable_variables[ len(self.independent_pars): ][i], dtype = tf.float32))
 
         # Reset the gradient accumulation steps counter to zero
         self.n_acum_step.assign(0)
