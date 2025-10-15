@@ -2,8 +2,6 @@
 import os
 import numpy as np
 
-
-
 import tensorflow as tf
 from tensorflow import keras
 import tensorflow_probability as tfp
@@ -25,6 +23,7 @@ class FrailtyModelNN(keras.models.Model):
         self.neural_network_call = neural_network_call
         self.n_acum_step = tf.Variable(0, dtype = tf.int32, trainable = False)
 
+        self.input_dim = input_dim
         self.seed = seed
 
         if(input_dim is not None):
@@ -86,16 +85,12 @@ class FrailtyModelNN(keras.models.Model):
             )
 
         # Include variables that are not trained by tensorflow (known, fixed constants or manual trained variables)
-        for parameter in np.concatenate([self.fixed_pars, self.manual_pars]):            
+        for parameter in np.concatenate([self.fixed_pars, self.manual_pars]):
             par = self.parameters[parameter]
-
-            raw_parameter = "raw_" + parameter
-            raw_init = par["link_inv"]( par["init"] )
-            
-            self.model_variables[raw_parameter] = self.add_weight(
-                name = raw_parameter,
+            self.model_variables[parameter] = self.add_weight(
+                name = parameter,
                 shape = par["shape"],
-                initializer = keras.initializers.Constant( raw_init ),
+                initializer = keras.initializers.Constant( par["initializer"] ),
                 trainable = False,
                 dtype = tf.float32
             )
@@ -141,11 +136,23 @@ class FrailtyModelNN(keras.models.Model):
             tf.Variable(tf.zeros_like(v, dtype = tf.float32), trainable = False) for v in self.trainable_variables[ len(self.independent_pars): ]
         ]
 
+    def copy(self):
+        new_model = FrailtyModelNN(parameters = self.parameters,
+                                   loglikelihood_loss = self.loglikelihood_loss,
+                                   neural_network_structure = self.neural_network_structure,
+                                   neural_network_call = self.neural_network_call,
+                                   input_dim = self.input_dim, seed = self.seed)        
+        new_model.set_weights( self.get_weights() )
+        return new_model
 
-    def call(self, x_input):
+    def call(self, x_input, training = True):
         if(self.neural_network_call is None):
             return None
-        return self.neural_network_call(self, x_input)
+        x = self.neural_network_call(self, x_input)
+        if(training):
+            return x
+
+        return tf.reshape(x, (x.shape[0], x.shape[1], 1, 1))
 
     def get_variable(self, parameter, nn_output = None):
         """
@@ -163,10 +170,14 @@ class FrailtyModelNN(keras.models.Model):
         # If nn_output is None, assume the parameter is independent from the data x and get it directly as a transformed weight
         if(nn_output is None):            
             # Get the transformed parameter from its raw version, considering its proper link function
-            return par["link"]( self.model_variables[raw_parameter] )
+            par_value = par["link"]( self.model_variables[raw_parameter] )
+            # return self.format_variable( par_value )
+            return par_value
         
         # If nn_output is not None, assume the parameter came as a neural network output and return it from its positions in the output
-        return par["link"]( tf.gather(nn_output, self.vars_to_index[raw_parameter], axis = 1) )
+        par_value = par["link"]( tf.gather(nn_output, self.vars_to_index[raw_parameter], axis = 1) )
+        # return self.format_variable( par_value )
+        return par_value
 
     def train_step(self, data):
         """
@@ -214,19 +225,17 @@ class FrailtyModelNN(keras.models.Model):
 
     def apply_accumulated_gradients(self):
         # ----------------------------------- Independent parameters component -----------------------------------
-        if( len(self.independent_pars) > 0 ):
-            # Apply the accumulated gradients to the trainable variables
-            self.optimizer_independent_pars.apply_gradients( zip(self.gradient_accumulation_independent_pars, self.trainable_variables[ :len(self.independent_pars) ]) )
-            # Resets all the cumulated gradients to zero
-            for i in range(len(self.gradient_accumulation_independent_pars)):
-                self.gradient_accumulation_independent_pars[i].assign(tf.zeros_like(self.trainable_variables[ :len(self.independent_pars) ][i], dtype = tf.float32))
-
+        # Apply the accumulated gradients to the trainable variables
+        self.optimizer_independent_pars.apply_gradients( zip(self.gradient_accumulation_independent_pars, self.trainable_variables[ :len(self.independent_pars) ]) )
+        # Resets all the cumulated gradients to zero
+        for i in range(len(self.gradient_accumulation_nn)):
+            self.gradient_accumulation_independent_pars[i].assign(tf.zeros_like(self.trainable_variables[ :len(self.independent_pars) ][i], dtype = tf.float32))
+        
         # ----------------------------------- Neural network component -----------------------------------
-        if( len(self.nn_pars) > 0 ):
-            self.optimizer_nn.apply_gradients( zip(self.gradient_accumulation_nn, self.trainable_variables[ len(self.independent_pars): ]) )
-            # Resets all the cumulated gradients to zero
-            for i in range(len(self.gradient_accumulation_nn)):
-                self.gradient_accumulation_nn[i].assign(tf.zeros_like(self.trainable_variables[ len(self.independent_pars): ][i], dtype = tf.float32))
+        self.optimizer_nn.apply_gradients( zip(self.gradient_accumulation_nn, self.trainable_variables[ len(self.independent_pars): ]) )
+        # Resets all the cumulated gradients to zero
+        for i in range(len(self.gradient_accumulation_nn)):
+            self.gradient_accumulation_nn[i].assign(tf.zeros_like(self.trainable_variables[ len(self.independent_pars): ][i], dtype = tf.float32))
 
         # Reset the gradient accumulation steps counter to zero
         self.n_acum_step.assign(0)
@@ -371,4 +380,99 @@ class FrailtyModelNN(keras.models.Model):
             batch_size = self.train_batch_size,
             shuffle = shuffle
         )
+
+    def plot_loglikelihood(self, par1, par2, par1_low, par1_high, par2_low, par2_high, n = 1000, colorscale = 'Inferno', local_maxima = True, neighborhood_range = 1.0):
+        """
+            Plot the profile log-likelihood for two chosen parameters from the model. If local_maxima is enabled, the surface is concentrated around the local maxima region,
+            ignoring the log-likelihood in points that are further away from it. That may improve visualization when the likelihood value varies too much from a region to the other,
+            which may end up blowing up the plot scale.
+        """
+        model_copy = self.copy()
+        par1_values = tf.linspace(par1_low, par1_high, n)
+        par2_values = tf.linspace(par2_low, par2_high, n)
+
+        # Get the config object for par1 from the dictionary
+        # and set the model_copy variables as their raw parameters
+        par1_obj = self.parameters[par1]
+        raw_par1 = "raw_" + par1
+        raw_par1_values = par1_obj["link_inv"]( par1_values )
+        par2_obj = self.parameters[par2]
+        raw_par2 = "raw_" + par2
+        raw_par2_values = par2_obj["link_inv"]( par2_values )
+
+        # Both variables of interest gets replaced by tensors, with extra dimensions so the loss function return a results from broadcasting
+        # When we call the model with training = False, every possible higher rank tensor gets remapped to have rank 4, so that this part of the code does not break
+        model_copy.model_variables[raw_par1] = tf.Variable(
+            tf.constant(raw_par1_values, dtype = tf.float32, shape = (1, 1, len(par1_values), 1)), trainable = False
+        )
+        model_copy.model_variables[raw_par2] = tf.Variable(
+            tf.constant(raw_par2_values, dtype = tf.float32, shape = (1, 1, 1, len(par2_values))), trainable = False
+        )
+
+        nn_output = model_copy(self.x_train, training = False)
+        t_reshaped = tf.reshape(self.t_train, shape = (self.t_train.shape[0], 1, 1, 1))
+        delta_reshaped = tf.reshape(self.delta_train, shape = (self.delta_train.shape[0], 1, 1, 1))
+        
+        # Obtain the log-likelihood values for different values of parameter 1 and 2
+        # Since the final loss shape is given by (1, dim_par1, dim_par2):
+        #     - (The first dim is reduced in reduce_main. The second one is temporary to a possible nn_output that is a vector)
+        loss_values_par1_par2 = model_copy.loglikelihood_loss(model = model_copy, nn_output = nn_output, t = t_reshaped, delta = delta_reshaped)
+
+        # If True, only plot the loh-likelihood function around the local maxima encountered, with a given neighborhood range
+        if(local_maxima):
+            par1_values_mesh, par2_values_mesh = np.meshgrid(par1_values, par2_values)
+
+            # Obtain the distance between each point in the parametric subspace from the optimal point found by the gradient descent method
+            distances_from_maxima = np.sqrt( ( np.transpose(par1_values_mesh) - self.get_variable(par1))**2 + (np.transpose(par2_values_mesh) - self.get_variable(par2))**2 )
+            
+            # Points that are too far away from the local maxima get removed from the plot by having the value np.nan
+            loss_values_par1_par2 = np.where(distances_from_maxima <= neighborhood_range, loss_values_par1_par2, np.nan)
+    
+        fig = go.Figure(data=[go.Surface(x = par1_values, y = par2_values, z = -np.transpose( loss_values_par1_par2 ), colorscale = colorscale)])
+        fig.update_layout(
+            title = dict(text = r"Profile-Loglikelihood surface ({} x {})".format(par1, par2)),
+            autosize = False,
+            width = 500, height = 500,
+            margin = dict(l = 65, r = 50, b = 65, t = 90)
+        )
+
+        self_nn_output = self(self.x_train, training = True)
+        current_loglikelihood_loss = self.loglikelihood_loss(model = self, nn_output = self_nn_output, t = self.t_train, delta = self.delta_train)
+
+        camera = dict(
+            eye=dict(x=-1.5, y=-1.5, z=1.5),  # negative x and y rotates 180° in XY
+            center=dict(x=0, y=0, z=0),
+            up=dict(x=0, y=0, z=1)
+        )
+        fig.update_layout(scene_camera = camera, scene = dict(
+            xaxis = dict(
+                tickangle=45,
+                title = dict(
+                    text = "{}".format(par1)
+                )
+            ),
+            yaxis = dict(
+                tickangle=-90,
+                title = dict(
+                    text = "{}".format(par2)
+                )
+            ),
+            zaxis = dict(
+                title = dict(
+                    text = "Profile-Loglikelihood"
+                )
+            ),
+        ))
+        fig.add_trace(go.Scatter3d(
+            x=[self.get_variable(par1)],
+            y=[self.get_variable(par2)],
+            z=[-current_loglikelihood_loss],
+            mode='markers+text',
+            marker=dict(size=10, color='red', symbol='circle'),
+            text=['Maximum estimate'],
+            textposition='top center'
+        ))
+
+        return fig
+    
         
