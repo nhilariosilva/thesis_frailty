@@ -387,6 +387,7 @@ class FrailtyModelNN(keras.models.Model):
             ignoring the log-likelihood in points that are further away from it. That may improve visualization when the likelihood value varies too much from a region to the other,
             which may end up blowing up the plot scale.
         """
+        
         model_copy = self.copy()
         par1_values = tf.linspace(par1_low, par1_high, n)
         par2_values = tf.linspace(par2_low, par2_high, n)
@@ -475,4 +476,63 @@ class FrailtyModelNN(keras.models.Model):
 
         return fig
     
+    def plot_grid_3d(self, figs, nrows, ncols, figsize = (12,8), vspace=0.05, hspace=0.05):   
+        specs = []
+        for i in range(nrows):
+            specs_row = []
+            for i in range(ncols): 
+                specs_row.append( {'type':'surface'} )
+            specs.append( specs_row )
         
+        fig = make_subplots(rows = nrows, cols = ncols, specs=specs)
+    
+        i, j = 1, 1
+        # Add traces
+        for k, f in enumerate(figs):
+            cb_x = (i - 0.5) / ncols + 0.5 / ncols - 0.05  # shift to right of subplot
+            cb_y = 1 - (j - 0.5) / nrows  # position vertically per row
+            
+            for trace in f.data:
+                new_trace = copy.deepcopy(trace)
+                # Ensure it's a surface trace before modifying colorbar
+                if isinstance(new_trace, go.Surface):
+                    new_trace.update(
+                        showscale=True,
+                        showlegend=False,
+                        colorbar=dict(
+                            x = cb_x + hspace / 2,  # shift colorbar horizontally
+                            y = cb_y - vspace / 2,
+                            len=(1 - (nrows - 1) * vspace) / nrows * 0.8,
+                            title = ""  # you can customize
+                        ),
+                    )
+                fig.add_trace(new_trace, row = j, col = i)
+    
+            i += 1
+            if((i-1) % ncols == 0):
+                i = 1
+                j += 1
+    
+        # Copy the plots layouts into each cell
+        for k, f in enumerate(figs, start=1):
+            scene_name = f'scene{k}'
+            fig.update_layout({
+                scene_name: dict(
+                    xaxis_title = f.layout.scene.xaxis.title.text if f.layout.scene.xaxis.title.text else '',
+                    yaxis_title = f.layout.scene.yaxis.title.text if f.layout.scene.yaxis.title.text else '',
+                    zaxis_title = f.layout.scene.zaxis.title.text if f.layout.scene.zaxis.title.text else '',
+                    camera = f.layout.scene.camera if 'camera' in f.layout.scene else None
+                )
+        })
+    
+        # Adjust layout to remove empty space between subplots
+        fig.update_layout(
+            height = nrows*500,
+            width = ncols*500,
+            margin=dict(l=0, r=0, t=0, b=0),
+            showlegend=False
+        )
+        
+        return fig
+    
+            
